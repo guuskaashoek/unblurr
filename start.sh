@@ -14,6 +14,12 @@ cd "$PROJECT_ROOT"
 if [ ! -d ".venv" ]; then
     echo "❌ Python virtual environment (.venv) not found."
     echo "   Please run the setup instructions to create it before starting."
+    echo "   python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+npm install
+deactivate
+./start.sh"
     exit 1
 fi
 
@@ -21,6 +27,12 @@ fi
 if ! command -v node &> /dev/null; then
     echo "❌ Node.js is not installed"
     exit 1
+fi
+
+# Ensure frontend dependencies are installed
+if [ ! -d "node_modules" ]; then
+    echo "📦 Installing npm dependencies..."
+    npm install
 fi
 
 source .venv/bin/activate
