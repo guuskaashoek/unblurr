@@ -22,6 +22,34 @@ esac
 echo "🖥️  Operating System: $OS_TYPE"
 echo ""
 
+# Check for libgl1 on Linux (required for OpenCV)
+if [ "$OS_TYPE" = "Linux" ]; then
+    echo "🔍 Checking for libgl1 (required for OpenCV)..."
+    if ! ldconfig -p | grep -q libGL.so.1 2>/dev/null; then
+        echo "⚠️  libgl1 not found. Attempting to install..."
+        if command -v apt-get &> /dev/null; then
+            if [ "$EUID" -eq 0 ]; then
+                apt-get update && apt-get install -y libgl1
+            else
+                echo "   Running: sudo apt-get update && sudo apt-get install -y libgl1"
+                sudo apt-get update && sudo apt-get install -y libgl1
+            fi
+            if [ $? -eq 0 ]; then
+                echo "✅ libgl1 installed successfully"
+            else
+                echo "⚠️  Warning: Could not install libgl1 automatically"
+                echo "   You may need to run manually: sudo apt-get update && sudo apt-get install -y libgl1"
+            fi
+        else
+            echo "⚠️  Warning: apt-get not found. Please install libgl1 manually"
+            echo "   For Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y libgl1"
+        fi
+    else
+        echo "✅ libgl1 found"
+    fi
+    echo ""
+fi
+
 # Check Python installation
 echo "🔍 Checking Python installation..."
 if ! command -v python3 &> /dev/null && ! command -v python &> /dev/null; then
