@@ -32,7 +32,7 @@ The application uses Real-ESRGAN models that are automatically downloaded on fir
 ### 1. Clone the Repository
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/guuskaashoek/unblurr.git
 cd unblurr
 ```
 
