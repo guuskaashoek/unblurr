@@ -5,6 +5,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Check, Loader2, Sparkles, Upload, X } from "lucide-react";
 
 type ModelKey = "detail" | "text";
+type Mode = "upscale" | "crop";
 
 interface ModelOption {
   title: string;
@@ -17,6 +18,12 @@ interface TileProgress {
   total: number;
 }
 
+interface CropDimension {
+  id: string;
+  width: number;
+  height: number;
+}
+
 interface UploadedFile {
   id: string;
   file: File;
@@ -24,6 +31,8 @@ interface UploadedFile {
   error?: string;
   preview?: string;
   model: ModelKey;
+  mode: Mode;
+  cropDimensions?: CropDimension[];
   progress: number;
   tiles?: TileProgress;
   backendStatus?: "pending" | "processing" | "completed" | "error";
@@ -52,6 +61,7 @@ const MODEL_OPTIONS: Record<ModelKey, ModelOption> = {
 };
 
 const PROGRESS_POLL_INTERVAL = 400;
+const PROGRESS_EPSILON = 0.005;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -59,6 +69,11 @@ export default function UnblurApp() {
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [selectedModel, setSelectedModel] = useState<ModelKey>("detail");
+  const [mode, setMode] = useState<Mode>("upscale");
+  const [cropDimensions, setCropDimensions] = useState<CropDimension[]>([
+    { id: "1", width: 1200, height: 628 },
+    { id: "2", width: 1200, height: 1200 },
+  ]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
 
@@ -75,6 +90,8 @@ export default function UnblurApp() {
         status: "pending",
         preview,
         model: selectedModel,
+        mode: mode,
+        cropDimensions: mode === "crop" ? cropDimensions : undefined,
         progress: 0,
         tiles: undefined,
         backendStatus: "pending",
@@ -125,34 +142,73 @@ export default function UnblurApp() {
           }
 
           const data = (await response.json()) as ProgressResponse;
-          setFiles((previous) =>
-            previous.map((file) => {
+          setFiles((previous) => {
+            let mutated = false;
+            const next = previous.map((file) => {
               if (file.id !== uploadedFile.id) {
                 return file;
               }
 
-              const next: UploadedFile = {
-                ...file,
-                progress: data.progress !== undefined ? Math.min(1, Math.max(0, data.progress)) : file.progress,
-                tiles:
-                  data.completed !== undefined && data.total !== undefined
-                    ? { completed: data.completed, total: data.total }
-                    : file.tiles,
-                backendStatus: data.status ?? file.backendStatus,
-                backendMessage: data.message ?? file.backendMessage,
-              };
+              const rawProgress = data.progress !== undefined ? Math.min(1, Math.max(0, data.progress)) : file.progress;
+              let nextProgress = rawProgress;
+              let nextStatus: UploadedFile["status"] = file.status;
+              let nextError = file.error;
 
               if (data.status === "error") {
-                next.status = "error";
-                next.error = data.message ?? file.error ?? "Processing failed";
+                nextStatus = "error";
+                nextError = data.message ?? file.error ?? "Processing failed";
               } else if (data.status === "completed") {
-                next.status = "completed";
-                next.progress = 1;
+                nextStatus = "completed";
+                nextProgress = 1;
               }
 
-              return next;
-            }),
-          );
+              let nextTiles = file.tiles;
+              if (data.completed !== undefined && data.total !== undefined) {
+                const completed = data.completed;
+                const total = data.total;
+                if (!file.tiles || file.tiles.completed !== completed || file.tiles.total !== total) {
+                  nextTiles = { completed, total };
+                }
+              }
+
+              const nextBackendStatus = data.status ?? file.backendStatus;
+              const nextBackendMessage = data.message ?? file.backendMessage;
+
+              const progressChanged =
+                typeof nextProgress === "number" && typeof file.progress === "number"
+                  ? Math.abs(nextProgress - file.progress) > PROGRESS_EPSILON
+                  : nextProgress !== file.progress;
+              const tilesChanged = nextTiles !== file.tiles;
+              const backendStatusChanged = nextBackendStatus !== file.backendStatus;
+              const backendMessageChanged = nextBackendMessage !== file.backendMessage;
+              const statusChanged = nextStatus !== file.status;
+              const errorChanged = nextError !== file.error;
+
+              if (
+                !progressChanged &&
+                !tilesChanged &&
+                !backendStatusChanged &&
+                !backendMessageChanged &&
+                !statusChanged &&
+                !errorChanged
+              ) {
+                return file;
+              }
+
+              mutated = true;
+              return {
+                ...file,
+                progress: typeof nextProgress === "number" ? nextProgress : file.progress,
+                tiles: nextTiles,
+                backendStatus: nextBackendStatus,
+                backendMessage: nextBackendMessage,
+                status: nextStatus,
+                error: nextError,
+              };
+            });
+
+            return mutated ? next : previous;
+          });
 
           if (data.status === "completed" || data.status === "error") {
             break;
@@ -169,7 +225,12 @@ export default function UnblurApp() {
       const formData = new FormData();
       formData.append("file", uploadedFile.file);
       formData.append("model", uploadedFile.model);
+      formData.append("mode", uploadedFile.mode);
       formData.append("jobId", uploadedFile.id);
+
+      if (uploadedFile.mode === "crop" && uploadedFile.cropDimensions) {
+        formData.append("cropDimensions", JSON.stringify(uploadedFile.cropDimensions));
+      }
 
       const response = await fetch("/api/unblur", {
         method: "POST",
@@ -185,7 +246,9 @@ export default function UnblurApp() {
       const downloadUrl = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = downloadUrl;
-      link.download = uploadedFile.file.name;
+      link.download = uploadedFile.mode === "crop" 
+        ? `${uploadedFile.file.name.replace(/\.[^/.]+$/, "")}_crops.zip`
+        : uploadedFile.file.name;
       link.style.display = "none";
       document.body.appendChild(link);
       link.click();
@@ -276,6 +339,23 @@ export default function UnblurApp() {
     setFiles([]);
   };
 
+  const addCropDimension = () => {
+    const newId = String(Math.max(0, ...cropDimensions.map(d => parseInt(d.id, 10))) + 1);
+    setCropDimensions([...cropDimensions, { id: newId, width: 800, height: 600 }]);
+  };
+
+  const removeCropDimension = (id: string) => {
+    if (cropDimensions.length > 1) {
+      setCropDimensions(cropDimensions.filter(d => d.id !== id));
+    }
+  };
+
+  const updateCropDimension = (id: string, field: "width" | "height", value: number) => {
+    setCropDimensions(cropDimensions.map(d => 
+      d.id === id ? { ...d, [field]: value } : d
+    ));
+  };
+
   return (
     <div className="relative min-h-screen overflow-hidden bg-[#05050b] text-slate-100">
       <motion.div
@@ -316,6 +396,111 @@ export default function UnblurApp() {
         </header>
 
         <section className="flex flex-col gap-6 rounded-2xl border border-white/10 bg-white/5 p-6 backdrop-blur-xl md:p-8">
+          {/* Mode Selector */}
+          <div className="flex flex-col gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-white">Processing mode</h2>
+              <p className="text-sm text-slate-300/80">
+                Choose between upscaling or upscaling with cropping to multiple sizes.
+              </p>
+            </div>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-2">
+              {(["upscale", "crop"] as Mode[]).map((m) => {
+                const isActive = mode === m;
+                return (
+                  <motion.button
+                    key={m}
+                    onClick={() => setMode(m)}
+                    className={`relative overflow-hidden rounded-xl border px-4 py-3 text-left transition-colors ${
+                      isActive
+                        ? "border-transparent text-white"
+                        : "border-white/10 text-slate-300 hover:border-white/30"
+                    }`}
+                    whileTap={{ scale: 0.97 }}
+                    whileHover={!isActive ? { scale: 1.02 } : undefined}
+                  >
+                    {isActive && (
+                      <motion.span
+                        layoutId="mode-accent"
+                        className={`absolute inset-0 -z-10 bg-gradient-to-br ${
+                          m === "upscale"
+                            ? "from-blue-500/70 to-cyan-400/60"
+                            : "from-amber-500/70 to-orange-400/60"
+                        }`}
+                        initial={false}
+                        transition={{ type: "spring", stiffness: 250, damping: 30 }}
+                      />
+                    )}
+                    <span className="text-sm font-semibold uppercase tracking-wide text-white/80">
+                      {m === "upscale" ? "Upscale Only" : "Crop & Upscale"}
+                    </span>
+                    <p className="mt-1 text-xs text-white/70">
+                      {m === "upscale" ? "Enhance image with AI" : "Upscale and crop to sizes"}
+                    </p>
+                  </motion.button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Crop Dimensions Editor */}
+          {mode === "crop" && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              className="space-y-4 rounded-xl border border-white/10 bg-black/20 p-4"
+            >
+              <div>
+                <h3 className="text-base font-semibold text-white">Target dimensions</h3>
+                <p className="text-sm text-slate-300/70">
+                  Define all the sizes you want. Images will be upscaled to fit the largest dimension, then cropped.
+                </p>
+              </div>
+              <div className="space-y-3">
+                {cropDimensions.map((dim) => (
+                  <div key={dim.id} className="flex gap-3 items-end">
+                    <div className="flex-1">
+                      <label className="text-xs text-slate-300">Width (px)</label>
+                      <input
+                        type="number"
+                        value={dim.width}
+                        onChange={(e) => updateCropDimension(dim.id, "width", parseInt(e.target.value) || 0)}
+                        className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-white focus:border-white/30 focus:outline-none"
+                        min="100"
+                        max="4000"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="text-xs text-slate-300">Height (px)</label>
+                      <input
+                        type="number"
+                        value={dim.height}
+                        onChange={(e) => updateCropDimension(dim.id, "height", parseInt(e.target.value) || 0)}
+                        className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-white focus:border-white/30 focus:outline-none"
+                        min="100"
+                        max="4000"
+                      />
+                    </div>
+                    <button
+                      onClick={() => removeCropDimension(dim.id)}
+                      disabled={cropDimensions.length === 1}
+                      className="px-3 py-2 rounded-lg border border-white/10 text-red-300 hover:border-red-400/50 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={addCropDimension}
+                className="w-full rounded-lg border border-white/20 bg-white/5 px-4 py-2 text-sm text-slate-300 hover:bg-white/10 transition"
+              >
+                + Add dimension
+              </button>
+            </motion.div>
+          )}
+
           <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
             <div>
               <h2 className="text-lg font-semibold text-white">Model selector</h2>
@@ -443,7 +628,6 @@ export default function UnblurApp() {
                     return (
                       <motion.div
                         key={file.id}
-                        layout
                         initial={{ opacity: 0, y: 20 }}
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -10 }}
@@ -475,9 +659,14 @@ export default function UnblurApp() {
                                   {(file.file.size / 1024).toFixed(1)} KB · {MODEL_OPTIONS[file.model].title}
                                 </p>
                               </div>
-                              <span className="rounded-full border border-white/10 px-3 py-1 text-xs uppercase tracking-wide text-slate-200/80">
-                                {file.model === "detail" ? "Detail" : "Text"}
-                              </span>
+                              <div className="flex gap-2">
+                                <span className="rounded-full border border-white/10 px-3 py-1 text-xs uppercase tracking-wide text-slate-200/80">
+                                  {file.model === "detail" ? "Detail" : "Text"}
+                                </span>
+                                <span className="rounded-full border border-white/10 px-3 py-1 text-xs uppercase tracking-wide text-slate-200/80">
+                                  {file.mode === "upscale" ? "Upscale" : "Crop"}
+                                </span>
+                              </div>
                             </div>
                           </div>
 

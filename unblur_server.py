@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import threading
 import time
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -236,6 +238,7 @@ def build_upsampler(model_key: str, tile_override: Optional[int] = None) -> Real
 
 
 UPSAMPLERS: Dict[str, RealESRGANer] = {}
+MODEL_LOCKS: Dict[str, threading.Lock] = {key: threading.Lock() for key in MODEL_CONFIGS}
 
 
 def get_upsampler(model_key: str) -> RealESRGANer:
@@ -371,16 +374,19 @@ def _enhance_with_progress(
 def enhance_image(img: np.ndarray, model_key: str, job_id: str) -> np.ndarray:
     """Apply the selected Real-ESRGAN model to the provided RGB numpy array."""
     config = MODEL_CONFIGS[model_key]
-    upsampler = get_upsampler(model_key)
-    try:
-        return _enhance_with_progress(upsampler, img, model_key, job_id)
-    except RuntimeError as err:
-        logger.warning("Real-ESRGAN tiling fallback (%s) due to: %s", config.pretty, err)
-        smaller_tile = max(128, config.tile // 2)
-        _update_progress(job_id, message="Retrying with smaller tiles", completed=0, total=0, progress=0.0)
-        upsampler = build_upsampler(model_key, tile_override=smaller_tile)
-        UPSAMPLERS[model_key] = upsampler
-        return _enhance_with_progress(upsampler, img, model_key, job_id)
+    lock = MODEL_LOCKS[model_key]
+
+    with lock:
+        upsampler = get_upsampler(model_key)
+        try:
+            return _enhance_with_progress(upsampler, img, model_key, job_id)
+        except RuntimeError as err:
+            logger.warning("Real-ESRGAN tiling fallback (%s) due to: %s", config.pretty, err)
+            smaller_tile = max(128, config.tile // 2)
+            _update_progress(job_id, message="Retrying with smaller tiles", completed=0, total=0, progress=0.0)
+            upsampler = build_upsampler(model_key, tile_override=smaller_tile)
+            UPSAMPLERS[model_key] = upsampler
+            return _enhance_with_progress(upsampler, img, model_key, job_id)
 
 
 def unblur_image(image_path: str, model_key: str, job_id: str) -> np.ndarray:
@@ -399,6 +405,115 @@ def unblur_image(image_path: str, model_key: str, job_id: str) -> np.ndarray:
 
     logger.info("Image processing complete for job %s", job_id)
     return np.array(enhanced_img)
+
+
+def calculate_crop_bounds(
+    upscaled_width: int,
+    upscaled_height: int,
+    target_width: int,
+    target_height: int,
+) -> tuple[int, int, int, int]:
+    """
+    Calculate crop bounds to center-crop an upscaled image to target dimensions.
+    Returns (x_start, y_start, x_end, y_end)
+    """
+    # Calculate how much we need to crop
+    crop_width = min(upscaled_width, target_width)
+    crop_height = min(upscaled_height, target_height)
+    
+    # Center the crop
+    x_start = (upscaled_width - crop_width) // 2
+    y_start = (upscaled_height - crop_height) // 2
+    x_end = x_start + crop_width
+    y_end = y_start + crop_height
+    
+    return x_start, y_start, x_end, y_end
+
+
+def crop_image_to_size(
+    img: np.ndarray, target_width: int, target_height: int
+) -> np.ndarray:
+    """Crop image to exact target size with center alignment."""
+    height, width = img.shape[0:2]
+    x_start, y_start, x_end, y_end = calculate_crop_bounds(width, height, target_width, target_height)
+    cropped = img[y_start:y_end, x_start:x_end]
+    
+    # Ensure exact dimensions (in case of rounding)
+    if cropped.shape[0] != target_height or cropped.shape[1] != target_width:
+        cropped = cv2.resize(cropped, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
+    
+    return cropped
+
+
+def unblur_and_crop_image(
+    image_path: str,
+    model_key: str,
+    job_id: str,
+    crop_dimensions: list[dict[str, int]],
+) -> Dict[str, np.ndarray]:
+    """
+    Run Real-ESRGAN on image and create cropped versions for each target dimension.
+    Returns a dict mapping dimension string (e.g., "1200x628") to the cropped image.
+    """
+    logger.info(
+        "Processing image %s with model %s for cropping (job=%s, %d crops)",
+        image_path,
+        model_key,
+        job_id,
+        len(crop_dimensions),
+    )
+
+    img = Image.open(image_path).convert("RGB")
+    img_np = np.array(img)
+
+    # Find the maximum dimension among all targets
+    max_width = max(d["width"] for d in crop_dimensions)
+    max_height = max(d["height"] for d in crop_dimensions)
+    
+    logger.info("Target dimensions: max %dx%d", max_width, max_height)
+
+    # Enhance image - this will upscale it
+    enhanced = enhance_image(img_np, model_key, job_id)
+    enhanced_img = Image.fromarray(enhanced)
+    
+    logger.info(
+        "Enhanced image size: %dx%d (target max: %dx%d)",
+        enhanced_img.width,
+        enhanced_img.height,
+        max_width,
+        max_height,
+    )
+
+    # Calculate scale factor needed to fit the max dimension
+    # We need the image to be at least as large as the largest target
+    scale_factor = max(
+        max_width / enhanced_img.width,
+        max_height / enhanced_img.height,
+    )
+    
+    if scale_factor > 1.0:
+        new_width = int(enhanced_img.width * scale_factor)
+        new_height = int(enhanced_img.height * scale_factor)
+        logger.info("Upscaling to %dx%d (factor: %.2f)", new_width, new_height, scale_factor)
+        enhanced_img = enhanced_img.resize(
+            (new_width, new_height), Image.Resampling.LANCZOS
+        )
+
+    # Create cropped versions for each target dimension
+    result = {}
+    enhanced_np = np.array(enhanced_img)
+    
+    for dim in crop_dimensions:
+        target_w = dim["width"]
+        target_h = dim["height"]
+        key = f"{target_w}x{target_h}"
+        
+        cropped = crop_image_to_size(enhanced_np, target_w, target_h)
+        result[key] = cropped
+        logger.info("Created crop %s", key)
+
+    logger.info("Image processing complete for job %s", job_id)
+    return result
 
 
 @app.route("/api/health", methods=["GET"])
@@ -428,6 +543,7 @@ def unblur_endpoint():
 
     uploaded_file = request.files["file"]
     model_key = request.form.get("model", DEFAULT_MODEL_KEY)
+    mode = request.form.get("mode", "upscale")
     job_id = request.form.get("jobId") or str(uuid.uuid4())
 
     if model_key not in MODEL_CONFIGS:
@@ -441,25 +557,68 @@ def unblur_endpoint():
         uploaded_file.save(tmp_path)
 
     try:
-        result_rgb = unblur_image(tmp_path, model_key, job_id)
-        result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
-        success, encoded_img = cv2.imencode(
-            ".jpg", result_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
-        )
-        if not success:
-            raise RuntimeError("Failed to encode processed image")
+        # Handle crop mode
+        if mode == "crop":
+            crop_dimensions_str = request.form.get("cropDimensions", "[]")
+            try:
+                crop_dimensions = json.loads(crop_dimensions_str)
+            except json.JSONDecodeError:
+                crop_dimensions = []
 
-        snapshot = _progress_snapshot(job_id) or {}
-        completed_tiles = snapshot.get("total", snapshot.get("completed", 0))
-        _update_progress(job_id, status="completed", progress=1.0, completed=completed_tiles)
+            if not crop_dimensions:
+                raise ValueError("No crop dimensions provided")
 
-        response = send_file(
-            io.BytesIO(encoded_img.tobytes()),
-            mimetype="image/jpeg",
-            as_attachment=False,
-        )
-        response.headers["X-Job-Id"] = job_id
-        return response
+            # Process image with cropping
+            cropped_images = unblur_and_crop_image(tmp_path, model_key, job_id, crop_dimensions)
+
+            # Create a ZIP file with all cropped versions
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for dim_key, cropped_img in cropped_images.items():
+                    # Convert to BGR for cv2.imencode
+                    cropped_bgr = cv2.cvtColor(cropped_img, cv2.COLOR_RGB2BGR)
+                    success, encoded_img = cv2.imencode(
+                        ".jpg", cropped_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+                    )
+                    if not success:
+                        raise RuntimeError(f"Failed to encode cropped image {dim_key}")
+
+                    filename = f"{dim_key}.jpg"
+                    zf.writestr(filename, encoded_img.tobytes())
+
+            zip_buffer.seek(0)
+            _update_progress(job_id, status="completed", progress=1.0)
+
+            response = send_file(
+                zip_buffer,
+                mimetype="application/zip",
+                as_attachment=False,
+            )
+            response.headers["X-Job-Id"] = job_id
+            return response
+
+        # Original upscale mode (unchanged)
+        else:
+            result_rgb = unblur_image(tmp_path, model_key, job_id)
+            result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+            success, encoded_img = cv2.imencode(
+                ".jpg", result_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+            )
+            if not success:
+                raise RuntimeError("Failed to encode processed image")
+
+            snapshot = _progress_snapshot(job_id) or {}
+            completed_tiles = snapshot.get("total", snapshot.get("completed", 0))
+            _update_progress(job_id, status="completed", progress=1.0, completed=completed_tiles)
+
+            response = send_file(
+                io.BytesIO(encoded_img.tobytes()),
+                mimetype="image/jpeg",
+                as_attachment=False,
+            )
+            response.headers["X-Job-Id"] = job_id
+            return response
+
     except Exception as exc:  # pragma: no cover - runtime failure
         logger.exception("Image processing failed: %s", exc)
         _update_progress(job_id, status="error", message=str(exc))
