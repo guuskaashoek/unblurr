@@ -120,6 +120,7 @@ DEFAULT_MODEL_KEY = "detail"
 PROGRESS_LOCK = threading.Lock()
 PROGRESS: Dict[str, Dict[str, Any]] = {}
 PROGRESS_TTL_SECONDS = 600  # 10 minutes
+OUTPUT_IMAGES: Dict[str, np.ndarray] = {}  # Store output images for live preview
 
 
 def _cleanup_progress(now: Optional[float] = None) -> None:
@@ -132,6 +133,7 @@ def _cleanup_progress(now: Optional[float] = None) -> None:
                 expired.append(job_id)
         for job_id in expired:
             PROGRESS.pop(job_id, None)
+            OUTPUT_IMAGES.pop(job_id, None)
 
 
 def _initialize_progress(job_id: str, model_key: str) -> None:
@@ -142,10 +144,13 @@ def _initialize_progress(job_id: str, model_key: str) -> None:
             "progress": 0.0,
             "completed": 0,
             "total": 0,
+            "current_tile": 0,
+            "current_tile_progress": 0.0,
             "model": model_key,
             "message": None,
             "updated": now,
         }
+        OUTPUT_IMAGES[job_id] = None
 
 
 def _update_progress(job_id: str, **updates: Any) -> None:
@@ -261,11 +266,14 @@ def _tile_process_with_progress(upsampler: RealESRGANer, job_id: str) -> None:
     tiles_x = math.ceil(width / tile_size)
     tiles_y = math.ceil(height / tile_size)
     total_tiles = max(1, tiles_x * tiles_y)
-    _update_progress(job_id, total=total_tiles, completed=0, progress=0.0)
+    _update_progress(job_id, total=total_tiles, completed=0, progress=0.0, current_tile=0, current_tile_progress=0.0)
 
     completed = 0
     for y in range(tiles_y):
         for x in range(tiles_x):
+            tile_index = y * tiles_x + x + 1
+            _update_progress(job_id, current_tile=tile_index, current_tile_progress=0.0)
+            
             ofs_x = x * tile_size
             ofs_y = y * tile_size
             input_start_x = ofs_x
@@ -282,8 +290,14 @@ def _tile_process_with_progress(upsampler: RealESRGANer, job_id: str) -> None:
             input_tile_height = input_end_y - input_start_y
             input_tile = upsampler.img[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
 
+            # Update progress: start processing tile (25%)
+            _update_progress(job_id, current_tile_progress=0.25)
+            
             with torch.no_grad():
                 output_tile = upsampler.model(input_tile)
+
+            # Update progress: model inference done (75%)
+            _update_progress(job_id, current_tile_progress=0.75)
 
             output_start_x = input_start_x * upsampler.scale
             output_end_x = input_end_x * upsampler.scale
@@ -302,9 +316,20 @@ def _tile_process_with_progress(upsampler: RealESRGANer, job_id: str) -> None:
                 output_start_x_tile:output_end_x_tile,
             ]
 
+            # Update progress: tile complete (100%)
             completed += 1
             progress_value = min(0.99, completed / total_tiles)
-            _update_progress(job_id, completed=completed, progress=progress_value)
+            
+            # Store output image for live preview
+            with PROGRESS_LOCK:
+                if upsampler.output is not None:
+                    # Convert tensor to numpy for preview
+                    output_np = upsampler.output.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                    output_np = np.transpose(output_np[[2, 1, 0], :, :], (1, 2, 0))
+                    output_np = (output_np * 255.0).round().astype(np.uint8)
+                    OUTPUT_IMAGES[job_id] = output_np
+            
+            _update_progress(job_id, completed=completed, progress=progress_value, current_tile_progress=1.0)
 
 
 def _enhance_with_progress(
@@ -639,10 +664,39 @@ def progress_endpoint(job_id: str):
         "progress": snapshot.get("progress", 0.0),
         "completed": snapshot.get("completed", 0),
         "total": snapshot.get("total", 0),
+        "current_tile": snapshot.get("current_tile", 0),
+        "current_tile_progress": snapshot.get("current_tile_progress", 0.0),
         "model": snapshot.get("model"),
         "message": snapshot.get("message"),
         "updated": snapshot.get("updated"),
     })
+
+
+@app.route("/api/preview/<job_id>", methods=["GET"])
+def preview_endpoint(job_id: str):
+    """Return the current output image for live preview."""
+    _cleanup_progress()
+    with PROGRESS_LOCK:
+        preview_img = OUTPUT_IMAGES.get(job_id)
+        if preview_img is None:
+            return jsonify({"error": "Preview not available"}), 404
+        
+        # Convert RGB to BGR for cv2
+        preview_bgr = cv2.cvtColor(preview_img, cv2.COLOR_RGB2BGR)
+        success, encoded_img = cv2.imencode(
+            ".jpg", preview_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+        )
+        if not success:
+            return jsonify({"error": "Failed to encode preview"}), 500
+        
+        response = send_file(
+            io.BytesIO(encoded_img.tobytes()),
+            mimetype="image/jpeg",
+        )
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
 
 if __name__ == "__main__":
